@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
 import matplotlib.pyplot as plt
 import pandas as pd
 import scipy.stats as stats
@@ -16,7 +15,8 @@ from multiprocessing import Process, Manager, Value, Lock, Queue
 import warnings
 warnings.filterwarnings('ignore')
 
-
+data_mean = 0
+data_std = 1
 
 
 def open_datasets(args, train=True):
@@ -48,7 +48,7 @@ def open_datasets(args, train=True):
     return combined
 
 
-def prepare_data_inds(ds, args, train=True):
+def prepare_data_inds(ds, args, stage):
 
     """
     choose far left upper corner of data cube without replacement
@@ -57,13 +57,21 @@ def prepare_data_inds(ds, args, train=True):
     shape_adj = (shape[0]-args.time_depth, shape[1]-args.y_height, shape[2]-args.x_width)
 
     # random indices for train and the same for test
-    if train:
+    if stage == 'preparation':
+        random.seed(np.random.randint(1000))
+        batches_per_epoch = args.preparation_batches_per_epoch
+
+    elif stage == 'train':
         random.seed(np.random.randint(1000))
         batches_per_epoch = args.train_batches_per_epoch
 
-    else:
+    elif stage == 'test':
         random.seed(0)
         batches_per_epoch = args.test_batches_per_epoch
+    
+    elif stage == 'final_test':
+        random.seed(0)
+        batches_per_epoch = args.final_test_batches_per_epoch
 
     # Convert 3D indices to flat indices
     total_points = np.prod(shape_adj, dtype=np.int64)
@@ -86,10 +94,10 @@ def prepare_data_inds(ds, args, train=True):
     return np.array(valid_unique_indices)[:batches_per_epoch*args.batch_size]
 
 
-def loader(ds, args, train=True):
+def loader(ds, args, stage):
 
     # prepare inds of data cubes
-    inds = prepare_data_inds(ds, args, train=train)
+    inds = prepare_data_inds(ds, args, stage=stage)
 
     """
     create manager and shared variables for workers
@@ -152,6 +160,11 @@ def loader(ds, args, train=True):
             #print(f'ind {index_ptr.value}, queue {queue.qsize()}', flush=True)
             x = torch.from_numpy(np.stack(batch_x)[:, None]).float() # [N,1,T,y,x]
             y = torch.from_numpy(np.stack(batch_y)).float() # [N,y,x]
+
+            if args.standardization:
+                x = (x - data_mean) / data_std
+                y = (y - data_mean) / data_std
+
             yield x, y 
 
             batch_x = []
@@ -189,7 +202,9 @@ def create_cube(ind, ds, args):
     y = slice(ind[1], ind[1]+args.y_height)
     x = slice(ind[2], ind[2]+args.x_width)
 
-    return ds[args.var][t, y, x].fillna(0).compute().values
+    cube = ds[args.var][t, y, x].fillna(0).compute().values
+
+    return cube
 
 
 
@@ -201,33 +216,124 @@ class Precip3DCNN(nn.Module):
         self.bn1 = nn.BatchNorm3d(hidden)
         self.conv2 = nn.Conv3d(hidden, hidden, kernel_size=(3,3,3), padding=1)
         self.bn2 = nn.BatchNorm3d(hidden)
+        self.conv3 = nn.Conv3d(hidden, hidden, kernel_size=(3,3,3), padding=1)
+        self.bn3 = nn.BatchNorm3d(hidden)
         self.conv_time = nn.Conv3d(hidden, hidden, kernel_size=(time_depth,1,1))
         self.conv_out = nn.Conv2d(hidden, input, kernel_size=(3,3), padding=1)
 
     def forward(self, x):
 
-        h = nn.functional.relu(self.bn1(self.conv1(x)))
-        h = nn.functional.relu(self.bn2(self.conv2(h)))
+        h = nn.functional.gelu(self.bn1(self.conv1(x)))
+        h = nn.functional.gelu(self.bn2(self.conv2(h)))
+        h = nn.functional.gelu(self.bn3(self.conv3(h)))
         h = self.conv_time(h).squeeze(2)
-        output = nn.functional.relu(self.conv_out(h))
-
+        output = self.conv_out(h)
         return output
 
 
 
-def weighted_MSE(pred, true):
+def ks_distance(a, b):
+    # Sort the combined samples
+    data = np.sort(np.concatenate([a, b]))
+    # Compute ECDFs
+    ecdf_a = np.searchsorted(np.sort(a), data, side='right') / len(a)
+    ecdf_b = np.searchsorted(np.sort(b), data, side='right') / len(b)
+    # Compute max absolute difference
+    D = np.max(np.abs(ecdf_a - ecdf_b))
+    return D, data, ecdf_a, ecdf_b
+
+
+def preprocess_data(ds_train,
+                         args):
+
+    global data_mean, data_std
+
+    hist = []
+
+    for x, y in loader(ds_train, args, stage='preparation'):
+
+        hist.append(torch.concatenate((x.flatten(), y.flatten())).numpy())
+
+
+    hist = np.concatenate(hist).flatten()
+    data_mean = hist.mean()
+    data_std = hist.std()
+
+    old_weights = 1 / pd.Series(hist).value_counts().sort_index()
+    limit = np.percentile(hist, 99.999)
+
+    keys = np.linspace(0, 200, 2001)
+    weights = np.array([])
+
+    for k in keys:
+
+        if k < limit:
+            if k in old_weights.index:
+                weights = np.append(weights, old_weights[k])
+
+            else:
+                next_val = old_weights[k:].index[0]
+                prev_val = old_weights[:k].index[-1]
+                weights = np.append(weights, (old_weights[prev_val] + old_weights[next_val]) / 2)
+        
+        else:
+            weights = np.append(weights, old_weights[limit])
+            
+    weights = np.clip(weights, None, old_weights[limit])
+
+    '''
+    weights = np.clip(weights, 1e-6, old_weights[limit])
+    '''
+
+    
+    w_min, w_max = weights.min(), weights.max()
+    new_min, new_max = 1e-4, weights.max()
+
+    # logarithmic rescaling
+    weights_scaled = 10 ** (
+        (np.log10(weights) - np.log10(w_min)) / (np.log10(w_max) - np.log10(w_min)) *
+        (np.log10(new_max) - np.log10(new_min)) + np.log10(new_min) 
+        
+    )
+
+    if args.standardization:
+        keys = (keys - data_mean) / data_std
+
+    return torch.from_numpy(np.vstack((keys, weights_scaled)))
+
+
+def weighted_MSE(pred, true, loss_weights):
 
     true = true.flatten()
     pred = pred.flatten()
 
-    weights = 1 / pd.Series(true).value_counts().sort_index()
-    weights = torch.from_numpy(weights[true.numpy()].values) 
+    curr_weights = loss_weights[1, torch.searchsorted(loss_weights[0], true)]
 
-    return torch.mean(weights * (pred - true) ** 2)
-
+    return torch.mean(curr_weights * ((pred - true) ** 2))
 
 
-def train(model, optimizer, criterion, train_loss, ds_train, args, start):
+def global_grad_norm(model):
+
+    total_norm = 0
+
+    for p in model.parameters():
+        if p.grad is not None:
+            total_norm += torch.sum(torch.pow(p.grad.data, 2)).item()
+
+    total_norm = total_norm ** 0.5
+        
+    return total_norm
+
+
+def train(model, 
+          optimizer, 
+          criterion,
+          loss_weights, 
+          train_loss, 
+          train_grad, 
+          ds_train, 
+          args, 
+          start):
     
     # training phase
     model.train()
@@ -235,17 +341,19 @@ def train(model, optimizer, criterion, train_loss, ds_train, args, start):
     work_done = 0
     print(f'train log: {work_done}/100, time: {time.time() - start}, loss: {np.mean(train_loss[-10:])}', flush=True)
 
-    for x, y in loader(ds_train, args, train=True):
+    for x, y in loader(ds_train, args, stage='train'):
 
         x = x.to(args.device)
         y = y.to(args.device)
 
         optimizer.zero_grad()
 
-        loss = criterion(model(x), y)
+        loss = criterion(model(x), y, loss_weights)
         loss.backward()
 
         optimizer.step()
+
+        train_grad.append(global_grad_norm(model))
 
         train_loss.append(loss.item())
         progress = len(train_loss) % args.train_batches_per_epoch / args.train_batches_per_epoch * 100
@@ -256,10 +364,16 @@ def train(model, optimizer, criterion, train_loss, ds_train, args, start):
             print(f'train log: {work_done}/100, time: {time.time() - start}, loss: {np.mean(train_loss[-10:])}', flush=True)
         
 
-    return train_loss
+    return train_loss, train_grad
 
 
-def test(model, criterion, test_loss, ds_test, args, start):
+def test(model, 
+         criterion,
+         loss_weights, 
+         test_loss, 
+         ds_test, 
+         args, 
+         start):
         
     # test phase
     model.eval()
@@ -268,12 +382,12 @@ def test(model, criterion, test_loss, ds_test, args, start):
     print(f'test log: 0/1, time: {time.time() - start}, loss: nan', flush=True)
 
     with torch.no_grad():
-        for x, y in loader(ds_test, args, train=False):
+        for x, y in loader(ds_test, args, stage='test'):
 
             x = x.to(args.device)
             y = y.to(args.device)
 
-            loss = criterion(model(x), y)
+            loss = criterion(model(x), y, loss_weights)
 
             loss_sum += loss.item()
 
@@ -284,7 +398,11 @@ def test(model, criterion, test_loss, ds_test, args, start):
     return test_loss
 
     
-def final_test(model, ds, args, exp_dir, start):
+def final_test(model, 
+               ds_test, 
+               args, 
+               exp_dir, 
+               start):
 
     # prepare model and other variables for ploting metric for the final test on the best checkpoint
     model.to(args.device)
@@ -295,7 +413,7 @@ def final_test(model, ds, args, exp_dir, start):
     # final test loop
     print(f'final test log: 0/1, time: {time.time() - start}', flush=True)
     with torch.no_grad():
-        for x, y in loader(ds, args, train=False):
+        for x, y in loader(ds_test, args, stage='final_test'):
             
             x = x.to(args.device)
 
@@ -305,23 +423,52 @@ def final_test(model, ds, args, exp_dir, start):
             trues.append(y.numpy())
 
 
-    preds = np.concatenate(preds, axis=0)
     trues = np.concatenate(trues, axis=0)
+    preds = np.concatenate(preds, axis=0)
 
     test_dir = os.path.join(exp_dir, 'test')
     os.makedirs(test_dir, exist_ok=True)
 
     # evauate predicted values through histogram and scatter plot, and moment statistics
-    flat_pred = preds.flatten()
     flat_true = trues.flatten()
+    flat_pred = preds.flatten()
+
+    if args.standardization:
+        flat_true = flat_true * data_std + data_mean
+        flat_pred = flat_pred * data_std + data_mean
+
+    fig = plt.figure(figsize=(10,30), layout='constrained')
+    ax1 = fig.add_subplot(3,1,1)
+    ax2 = fig.add_subplot(3,1,2)
+    ax3 = fig.add_subplot(3,1,3)
+
     x = np.linspace(np.min(flat_true), np.max(flat_true), 200)
-    plt.figure()
-    plt.hist(flat_true, bins=x, density=True, log=True, alpha=0.5, label='true')
-    plt.hist(flat_pred, bins=x, density=True, log=True, alpha=0.5, label='pred')
-    plt.legend()
-    plt.title('PDF Comparison')
-    plt.savefig(os.path.join(test_dir, 'pdf_comparison.png'))
-    plt.close()
+    ax1.hist(flat_true, bins=x, density=True, log=True, alpha=0.5, label='true')
+    ax1.hist(flat_pred, bins=x, density=True, log=True, alpha=0.5, label='pred')
+    ax1.set_title('PDF Comparison')
+    ax1.set_ylabel('Density')
+    ax1.legend()
+    
+
+    D, x, cdf_true, cdf_pred = ks_distance(flat_true, flat_pred)
+    ax2.plot(x, cdf_true, label=f'true')
+    ax2.plot(x, cdf_pred, label=f'pred\nK_dist = {np.round(D*100, 2)}%')
+    ax2.set_ylabel('Cumulative Probability')
+    ax2.set_title('Kolmogorov-Smirnov Test')
+    ax2.legend()
+
+
+    ax3.scatter(flat_true, flat_pred, s=1, alpha=0.3)
+    m = max(flat_true.max(), flat_pred.max())
+    ax3.plot([0,m],[0,m],'k--')
+    ax3.set_xlabel('True')
+    ax3.set_ylabel('Pred')
+    ax3.set_title('Scatter')
+    ax3.legend()
+
+
+    fig.savefig(os.path.join(test_dir, 'pdf_comparison.png'))
+
 
     metrics = {
         'mean_true': flat_true.mean(),
@@ -336,21 +483,15 @@ def final_test(model, ds, args, exp_dir, start):
     }
     pd.DataFrame(metrics, index=[0]).to_csv(os.path.join(test_dir, 'metrics.csv'), index=False)
 
-    plt.figure()
-    plt.scatter(flat_true, flat_pred, s=1, alpha=0.3)
-    m = max(flat_true.max(), flat_pred.max())
-    plt.plot([0,m],[0,m],'k--')
-    plt.xlabel('True')
-    plt.ylabel('Pred')
-    plt.title('Scatter')
-    plt.savefig(os.path.join(test_dir, 'scatter.png'))
-    plt.close()
-
     print(f'final test log: 1/1, time: {time.time() - start}', flush=True)
 
 
-def start_experiment(model, args, exp_dir):
+def start_experiment(model, 
+                     args, 
+                     exp_dir):
+    
     start = time.time()
+    print(f"Start experiment, time: {time.time() - start}", flush=True)
 
     # open train and test datasets
     ds_train = open_datasets(args, train=True)
@@ -358,6 +499,7 @@ def start_experiment(model, args, exp_dir):
 
     # initialze loss function and optimizer
     model.to(args.device)
+    loss_weights = preprocess_data(ds_train, args).to(args.device)
     criterion = weighted_MSE
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     best_val = float('inf')
@@ -373,31 +515,57 @@ def start_experiment(model, args, exp_dir):
     print(f'Total num. epochs: {args.epochs}', flush=True)
     print(f'Num. train batches per epoch: {args.train_batches_per_epoch}', flush=True)
     print(f'Num. test batches per epoch: {args.test_batches_per_epoch}', flush=True)
+    print(f'Num. final test batches per epoch: {args.final_test_batches_per_epoch}', flush=True)
+    
     
     # additional arrays for losses
     train_loss = []
+    train_grad = []
     test_loss = []
     loss_png = os.path.join(exp_dir, 'loss_curve.png')
 
     # main train + test loop
     for epoch in range(1, args.epochs+1):
 
-        train_loss = train(model, optimizer, criterion, train_loss, ds_train, args, start)
+        print(f"Epoch {epoch} started, time: {time.time() - start}", flush=True)
 
-        test_loss = test(model, criterion, test_loss, ds_test, args, start)
+        train_loss, train_grad = train(model, 
+                                       optimizer, 
+                                       criterion,
+                                       loss_weights, 
+                                       train_loss, 
+                                       train_grad, 
+                                       ds_train, 
+                                       args, 
+                                       start)
+
+        test_loss = test(model, 
+                         criterion,
+                         loss_weights, 
+                         test_loss, 
+                         ds_test, 
+                         args, 
+                         start)
 
         print(f"Epoch {epoch} finished, time: {time.time() - start}, train loss={np.mean(train_loss[-10:])}, test loss={test_loss[-1]}", flush=True)
         
         # update loss curve plot
-        plt.figure()
-        plt.semilogy(train_loss, label='train')
-        plt.semilogy(np.linspace(1,len(train_loss),len(test_loss)), test_loss, label='test')
-        plt.legend()
-        plt.xlabel('Updates')
-        plt.ylabel('Loss')
-        plt.title('Loss Curve')
-        plt.savefig(loss_png)
-        plt.close()
+        fig = plt.figure(figsize=(10,10), layout='constrained')
+        ax1 = fig.add_subplot(2,1,1)
+        ax2 = fig.add_subplot(2,1,2)
+
+        ax1.semilogy(train_loss, label='train')
+        ax1.semilogy(np.linspace(1,len(train_loss),len(test_loss)), test_loss, label='test')
+        ax1.set_xlabel('Updates')
+        ax1.set_ylabel('Loss')
+        ax1.legend()
+
+        ax2.semilogy(train_grad, label='global_grad_norm')
+        ax2.set_xlabel('Updates')
+        ax2.set_ylabel('Grad_norm')
+        ax2.legend()
+        
+        fig.savefig(loss_png)
 
         
         # overwrite checkpoint on improvement
@@ -416,10 +584,15 @@ def start_experiment(model, args, exp_dir):
 
     # final test + metrics
     model.load_state_dict(torch.load(model_checkp))
-    final_test(model, ds_test, args, exp_dir, start)
+    print(f"Final test, time: {time.time() - start}", flush=True)
+    final_test(model, 
+               ds_test, 
+               args, 
+               exp_dir, 
+               start)
 
 
-    print(f"finish", flush=True)
+    print(f"Finish experiment, time: {time.time() - start}", flush=True)
 
     
 

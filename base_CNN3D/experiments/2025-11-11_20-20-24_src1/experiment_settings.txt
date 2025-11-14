@@ -1,0 +1,24 @@
+Command: run_experiments.py 
+Arguments:
+  data_dir: /scratch/aerofeev/hyras/data1
+  version: v6-1
+  chunks: {'time': 100}
+  train_time_slice: slice(0, 20, None)
+  test_time_slice: slice(20, 21, None)
+  epochs: 2
+  preparation_batches_per_epoch: 25
+  train_batches_per_epoch: 500
+  test_batches_per_epoch: 100
+  final_test_batches_per_epoch: 250
+  batch_size: 500
+  standardization: False
+  var: pr
+  validity: 0.9
+  num_workers: 20
+  time_depth: 11
+  y_height: 20
+  x_width: 20
+  lr: 0.001
+  wd: 1e-05
+  device: cuda:2
+  total_parameters: 1054465

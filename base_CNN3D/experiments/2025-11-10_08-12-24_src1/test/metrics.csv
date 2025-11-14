@@ -1,0 +1,2 @@
+mean_true,mean_pred,var_true,var_pred,skew_true,skew_pred,kurt_true,kurt_pred,rmse
+2.2261372,28.323381,18.866236,75.90782,3.4401166439056396,2.20797061920166,17.033604,12.640362,27.843754

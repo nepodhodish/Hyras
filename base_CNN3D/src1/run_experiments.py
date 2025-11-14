@@ -1,4 +1,4 @@
-# nohup python run_experiment.py 2>&1 &
+# nohup python3 run_experiment.py 2>&1 &
 # disown
 import time
 import os
@@ -24,7 +24,6 @@ import CNN_3D
 
 def main():
 
-
     # parameters
     parser = argparse.ArgumentParser(description='Run 3D-CNN precipitation experiments')
     parser.add_argument('--data_dir', type=str, default=os.path.join(MAIN_DIR, 'data1'), 
@@ -33,16 +32,24 @@ def main():
                         help='Data version to use')
     parser.add_argument('--chunks', type=dict, default={'time': 100}, 
                         help='Chunking rule for loading data')
-    parser.add_argument('--train_time_slice', type=slice, default=slice(0,10), 
-                        help='Which years to take')
-    parser.add_argument('--test_time_slice', type=slice, default=slice(10,11), 
-                        help='Which years to take')
-    parser.add_argument('--train_batches_per_epoch', type=int, default=1000, 
+    parser.add_argument('--train_time_slice', type=slice, default=slice(0,20), 
+                        help='Which years to take for training')
+    parser.add_argument('--test_time_slice', type=slice, default=slice(20,21), 
+                        help='Which years to take for test')
+    parser.add_argument('--epochs', type=int, default=2, 
+                        help='Number of training epochs')
+    parser.add_argument('--preparation_batches_per_epoch', type=int, default=25, 
+                        help='Num. preparation batches per epoch')
+    parser.add_argument('--train_batches_per_epoch', type=int, default=500, 
                         help='Num. train batches per epoch')
     parser.add_argument('--test_batches_per_epoch', type=int, default=100, 
                         help='Num. test batches per epoch')
-    parser.add_argument('--epochs', type=int, default=10, 
-                        help='Number of training epochs')
+    parser.add_argument('--final_test_batches_per_epoch', type=int, default=250, 
+                        help='Num. final test batches per epoch')
+    parser.add_argument('--batch_size', type=int, default=500, 
+                        help='Training batch size')
+    parser.add_argument('--standardization', type=bool, default=True, 
+                        help='Data standardization')
     parser.add_argument('--var', type=str, default='pr', 
                         help='We are working with precipitation data')
     parser.add_argument('--validity', type=float, default=0.9, 
@@ -55,13 +62,11 @@ def main():
                         help='Height of data cube along Y axis')
     parser.add_argument('--x_width', type=int, default=20, 
                         help='Width of data cube along X axis')
-    parser.add_argument('--batch_size', type=int, default=100, 
-                        help='Training batch size')
     parser.add_argument('--lr', type=float, default=1e-3, 
                         help='Learning rate')
     parser.add_argument('--wd', type=float, default=1e-5, 
                         help='Weight decay')
-    parser.add_argument('--device', type=str, default=('cpu' if torch.cuda.is_available() else 'cpu'), help='Device')
+    parser.add_argument('--device', type=str, default=('cuda:2' if torch.cuda.is_available() else 'cpu'), help='Device')
     args = parser.parse_args()
 
 
@@ -72,7 +77,7 @@ def main():
 
 
     # establish main model
-    model = CNN_3D.Precip3DCNN(input=1, hidden=32, time_depth=args.time_depth-1)
+    model = CNN_3D.Precip3DCNN(input=1, hidden=128, time_depth=args.time_depth-1)
 
     
     # count number of parameters
